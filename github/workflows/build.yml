@@ -1,0 +1,181 @@
+name: Build Windows Installers (x86/x64 + Setup)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        arch: [x86, x64]
+
+    steps:
+    - name: 🧩 Checkout repository
+      uses: actions/checkout@v3
+
+    - name: 🐍 Set up Python 3.8
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.8'
+        architecture: ${{ matrix.arch }}
+
+    - name: 📦 Install dependencies
+      shell: pwsh
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+
+        if (Test-Path "Servidor/requirements-server.txt") {
+          Write-Host "✅ Instalando dependencias del servidor..."
+          pip install -r Servidor/requirements-server.txt
+        } else {
+          Write-Host "⚠️ Archivo requirements-server.txt no encontrado."
+        }
+
+        if (Test-Path "Cliente/requirements-client.txt") {
+          Write-Host "✅ Instalando dependencias del cliente..."
+          pip install -r Cliente/requirements-client.txt
+        } else {
+          Write-Host "⚠️ Archivo requirements-client.txt no encontrado."
+        }
+
+    - name: ✅ Verify Python syntax
+      shell: pwsh
+      run: |
+        python -m py_compile Servidor/server.py
+        python -m py_compile Cliente/client_app.py
+
+    - name: 🧱 Build Client (.exe)
+      shell: pwsh
+      run: |
+        Write-Host "Compilando Cliente para arquitectura ${{ matrix.arch }}..."
+        cd Cliente
+        pyinstaller --onefile --noconsole client_app.py --name Cliente_${{ matrix.arch }}
+        cd ..
+
+    - name: 🧱 Build Server (.exe)
+      shell: pwsh
+      run: |
+        Write-Host "Compilando Servidor para arquitectura ${{ matrix.arch }}..."
+        cd Servidor
+        pyinstaller --onefile --noconsole server.py --name Servidor_${{ matrix.arch }}
+        cd ..
+
+    - name: 📦 Install Inno Setup
+      shell: pwsh
+      run: |
+        choco install innosetup --no-progress -y
+
+    - name: 🧰 Create Setup installer
+      shell: pwsh
+      run: |
+        $clientPath = "Cliente\\dist\\Cliente_${{ matrix.arch }}.exe"
+        $serverPath = "Servidor\\dist\\Servidor_${{ matrix.arch }}.exe"
+        $issFile = "installer_${{ matrix.arch }}.iss"
+
+        # Crear el archivo base .iss
+        Set-Content -Path $issFile -Value "[Setup]"
+        Add-Content $issFile "AppName=GestorInventarioRepuestos"
+        Add-Content $issFile "AppVersion=1.0.${{ github.run_number }}"
+        Add-Content $issFile "AppPublisher=ZamirSoft"
+        Add-Content $issFile "DefaultDirName={pf}\\ZamirSoft\\GestorInventarioRepuestos"
+        Add-Content $issFile "DefaultGroupName=Gestor Inventario Repuestos"
+        Add-Content $issFile "OutputDir=."
+        Add-Content $issFile "OutputBaseFilename=GestorInventarioRepuestos_Setup_${{ matrix.arch }}"
+        Add-Content $issFile "Compression=lzma"
+        Add-Content $issFile "SolidCompression=yes"
+        Add-Content $issFile ""
+        Add-Content $issFile "[Files]"
+
+        if (Test-Path $clientPath) {
+          Add-Content $issFile "Source: `"$clientPath`"; DestDir: `{app`}"
+        } else {
+          Write-Host "⚠️ Cliente_${{ matrix.arch }}.exe no encontrado, omitiendo..."
+        }
+
+        if (Test-Path $serverPath) {
+          Add-Content $issFile "Source: `"$serverPath`"; DestDir: `{app`}"
+        } else {
+          Write-Host "⚠️ Servidor_${{ matrix.arch }}.exe no encontrado, omitiendo..."
+        }
+
+        Add-Content $issFile ""
+        Add-Content $issFile "[Icons]"
+
+        if (Test-Path $clientPath) {
+          Add-Content $issFile "Name: `{group`}\Cliente; Filename: `{app`}\Cliente_${{ matrix.arch }}.exe"
+        }
+
+        if (Test-Path $serverPath) {
+          Add-Content $issFile "Name: `{group`}\Servidor; Filename: `{app`}\Servidor_${{ matrix.arch }}.exe"
+        }
+
+        Add-Content $issFile "Name: `{group`}\Desinstalar; Filename: `{uninstallexe`}"
+
+        Add-Content $issFile ""
+        Add-Content $issFile "[Run]"
+
+        if (Test-Path $serverPath) {
+          Add-Content $issFile "Filename: `{app`}\Servidor_${{ matrix.arch }}.exe; Description: Iniciar Servidor; Flags: nowait postinstall skipifsilent"
+        }
+
+        if (Test-Path $clientPath) {
+          Add-Content $issFile "Filename: `{app`}\Cliente_${{ matrix.arch }}.exe; Description: Iniciar Cliente; Flags: nowait postinstall skipifsilent"
+        }
+
+        Write-Host "📄 Contenido final del script Inno Setup:"
+        Get-Content $issFile
+
+        iscc $issFile
+
+    - name: 📤 Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: installers-${{ matrix.arch }}
+        path: |
+          Cliente/dist/*
+          Servidor/dist/*
+          *.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: ⬇️ Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./dist
+
+    - name: 🗂️ List downloaded files
+      run: ls -R ./dist
+
+    - name: 🧹 Keep only Setup installers
+      run: |
+        echo "🔍 Manteniendo solo los instaladores Setup..."
+        mkdir ./setups
+        find ./dist -type f -name "*Setup_*.exe" -exec cp {} ./setups/ \;
+        echo "✅ Archivos seleccionados:"
+        ls -lh ./setups
+
+    - name: 🚀 Create GitHub Release (only Setup installers)
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v1.0.${{ github.run_number }}
+        name: "Gestor Inventario Repuestos v1.0.${{ github.run_number }}"
+        body: |
+          🧰 Instaladores oficiales de Gestor Inventario Repuestos
+          Incluye:
+          • Setup x86
+          • Setup x64
+          Compilado automáticamente por GitHub Actions.
+        files: ./setups/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
